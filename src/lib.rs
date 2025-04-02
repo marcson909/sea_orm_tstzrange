@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::{prelude::*, sea_query::{Nullable, SimpleExpr, ValueType, ValueTypeErr}, ColIdx, TryGetable, Value};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::types::PgRange;
+use anyhow::anyhow;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TstzRange(pub PgRange<DateTime<Utc>>);
@@ -15,6 +16,40 @@ impl TstzRange {
         TstzRange(PgRange { start, end })
     }
 
+    #[inline(always)]
+    fn clean_and_parse(date_str: &str) -> Result<DateTime<Utc>, ValueTypeErr> {
+        let s = date_str.strip_prefix("\"").unwrap_or(date_str);
+        let s = s.strip_suffix("\"").unwrap_or(s);
+
+        let s = if s.matches('+').count() == 1 && s.ends_with("+00") {
+            format!("{}:00", s)
+        } else {
+            s.to_string()
+        };
+        s.parse::<DateTime<Utc>>()
+        .inspect_err(|e| eprintln!("failed to parse dt: {e}"))
+        .map_err(|_| ValueTypeErr)
+    }
+
+    fn _parse_bound<T>(ch: char, value: Option<T>) -> Result<Bound<T>, anyhow::Error> {
+        Ok(if let Some(value) = value {
+            match ch {
+                '(' | ')' => Bound::Excluded(value),
+                '[' | ']' => Bound::Included(value),
+
+                _ => {
+
+                    return Err(anyhow!(
+                        "expected `(`, ')', '[', or `]` but found `{ch}` for range literal"
+                    )
+                    );
+                }
+            }
+        } else {
+            Bound::Unbounded
+        })
+    }
+
     pub fn from_string(s: &str) -> Result<Self, ValueTypeErr> {
         let parts: Vec<&str> = s.split(',').collect();
         if parts.len() != 2 {
@@ -22,7 +57,7 @@ impl TstzRange {
         }
 
         let start_str = parts[0];
-        let end_str = parts[1].trim_end_matches("::tstzrange");
+        let end_str = parts[1];
 
 
         let start = if start_str == "(" {
@@ -30,20 +65,7 @@ impl TstzRange {
         } else {
             let inclusive = start_str.starts_with('[');
             let date_str = &start_str[1..];
-            let s = date_str.strip_prefix("\"").unwrap_or(date_str);
-            let s = s.strip_suffix("\"").unwrap_or(s);
-
-            // Add minutes to timezone if it just has hours
-            let s = if s.matches('+').count() == 1 && s.ends_with("+00") {
-                format!("{}:00", s)  // Convert +00 to +00:00
-            } else {
-                s.to_string()
-            };
-
-            let dt = s.parse::<DateTime<Utc>>()
-                .inspect_err(|e| eprintln!("failed to parse dt: {e}", ))
-                .map_err(|_| ValueTypeErr)?;
-
+            let dt = Self::clean_and_parse(date_str)?;
 
             if inclusive {
                 Bound::Included(dt)
@@ -57,20 +79,7 @@ impl TstzRange {
         } else {
             let inclusive = end_str.ends_with(']');
             let date_str = &end_str[0..end_str.len()-1];
-            let s = date_str.strip_prefix("\"").unwrap_or(date_str);
-            let s = s.strip_suffix("\"").unwrap_or(s);
-
-
-            // Add minutes to timezone if it just has hours
-            let s = if s.matches('+').count() == 1 && s.ends_with("+00") {
-                format!("{}:00", s)  // Convert +00 to +00:00
-            } else {
-                s.to_string()
-            };
-
-            let dt = s.parse::<DateTime<Utc>>()
-                .inspect_err(|e| eprintln!("failed to parse dt: {e}", ))
-                .map_err(|_| ValueTypeErr)?;
+            let dt = Self::clean_and_parse(date_str)?;
 
             if inclusive {
                 Bound::Included(dt)
@@ -102,7 +111,6 @@ impl TstzRange {
         }
     }
 
-    // Get start and end as Option<DateTime<Utc>>
     pub fn start(&self) -> Option<DateTime<Utc>> {
         match &self.0.start {
             Bound::Included(dt) | Bound::Excluded(dt) => Some(*dt),
@@ -200,9 +208,9 @@ impl TryGetable for TstzRange {
         let value = res.try_get_by::<Option<String>, I>(idx)?.into();
         match value {
             Value::String(Some(s)) => {
-                let pg_range = TstzRange::from_string(&s)
+                let range = TstzRange::from_string(&s)
                     .map_err(|e| TryGetError::Null(e.to_string()))?;
-                Ok(pg_range)
+                Ok(range)
             }
             _ => Err(TryGetError::Null("Unexpected value type".to_string())),
         }
@@ -302,7 +310,6 @@ mod tests {
         let parsed = TstzRange::from_string(&string).unwrap();
         assert_eq!(range1, parsed);
 
-        // Test with unbounded end
         let start = Utc::now();
         let range2 = TstzRange::new(
             Bound::Included(start),
